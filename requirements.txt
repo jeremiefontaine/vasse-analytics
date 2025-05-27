@@ -1,0 +1,12 @@
+python-dotenv
+aiofiles
+aiohttp
+numpy
+pandas
+requests
+seaborn
+matplotlib
+pillow
+rich
+selenium
+openpyxl
