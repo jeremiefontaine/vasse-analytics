@@ -1,16 +1,12 @@
-# 40-cli.py
-
 import os
 import re
 import json
 import shutil
 import logging
 import traceback
-import threading
 import asyncio
 import concurrent.futures
 from datetime import datetime, timedelta
-from collections import defaultdict
 from typing import List, Dict, Any, Optional, Union
 
 import aiofiles
@@ -55,6 +51,10 @@ load_dotenv()
 # Stockage global des clients par défaut
 client_options = [{"value": -1, "name": "Sélectionner un élément..."}]
 
+# Concurrence configurable
+MAX_CONCURRENT_DOWNLOADS = int(os.getenv("VA_MAX_CONCURRENT", "20"))
+MAX_CONVERT_WORKERS = os.cpu_count() or 1
+
 
 # ----------------------------------------------------------------
 #     1) Divers : update_clients_json, connexion Selenium
@@ -87,9 +87,9 @@ def update_clients_json(client_name: str) -> None:
             data["clients"].sort()
             with clients_file.open('w', encoding='utf-8') as f:
                 json.dump(data, f, indent=4, ensure_ascii=False)
-            print(f"Client '{cname_underscore}' ajouté dans clients.json.")
+            logger.info("Client '%s' ajouté dans clients.json.", cname_underscore)
         else:
-            print(f"Client '{cname_underscore}' déjà présent dans clients.json.")
+            logger.info("Client '%s' déjà présent dans clients.json.", cname_underscore)
 
     except Exception as e:
         logging.error(f"Erreur update_clients_json: {e}")
@@ -283,6 +283,11 @@ def build_live_table(client_name: str, tasks: List[Dict[str, Any]]) -> Panel:
     return panel
 
 
+def set_task_progress(tasks: List[Dict[str, Any]], index: int, done: int, total: int) -> None:
+    percent = (done / total) * 100 if total else 100
+    tasks[index]["progress"] = f"{done}/{total} ({percent:.1f}%)"
+
+
 # ----------------------------------------------------------------
 #     3) Fonctions "métier" : Inventaire, Téléchargement, etc.
 # ----------------------------------------------------------------
@@ -418,11 +423,11 @@ async def download_images_for_subset(
     images_path = Path(images_dir)
     images_path.mkdir(parents=True, exist_ok=True)
 
-    semaphore = asyncio.Semaphore(20)
+    semaphore = asyncio.Semaphore(MAX_CONCURRENT_DOWNLOADS)
     total = len(df_sub)
     done = 0
 
-    tasks[index_task]["progress"] = f"0/{total} (0.0%)"
+    set_task_progress(tasks, index_task, 0, total)
     tasks[index_task]["ok"] = False
     live.update(build_live_table(client_name, tasks))
 
@@ -449,8 +454,7 @@ async def download_images_for_subset(
 
                     done += 1
 
-                percent = (done / total) * 100 if total > 0 else 100
-                tasks[index_task]["progress"] = f"{done}/{total} ({percent:.1f}%)"
+                set_task_progress(tasks, index_task, done, total)
                 live.update(build_live_table(client_name, tasks))
                 await asyncio.sleep(0)  # Laisser la boucle de rafraîchissement agir
 
@@ -529,19 +533,18 @@ def convert_images_to_webp_diff(
     total = len(to_convert)
     done = 0
 
-    tasks[index_task]["progress"] = f"0/{total} (0.0%)"
+    set_task_progress(tasks, index_task, 0, total)
     tasks[index_task]["ok"] = False
     live.update(build_live_table(client_name, tasks))
 
-    with concurrent.futures.ProcessPoolExecutor() as executor:
+    with concurrent.futures.ProcessPoolExecutor(max_workers=MAX_CONVERT_WORKERS) as executor:
         file_args = [(images_path, webp_path, x) for x in to_convert]
         futures = [executor.submit(convert_one_image, fa) for fa in file_args]
 
         for fut in concurrent.futures.as_completed(futures):
             _ = fut.result()
             done += 1
-            percent = (done / total) * 100 if total > 0 else 100
-            tasks[index_task]["progress"] = f"{done}/{total} ({percent:.1f}%)"
+            set_task_progress(tasks, index_task, done, total)
             live.update(build_live_table(client_name, tasks))
 
     tasks[index_task]["ok"] = True
@@ -615,7 +618,7 @@ async def retrieve_history_for_subset(
     total = len(products)
     done = 0
 
-    tasks[index_task]["progress"] = f"0/{total} (0.0%)"
+    set_task_progress(tasks, index_task, 0, total)
     tasks[index_task]["ok"] = False
     live.update(build_live_table(client_name, tasks))
 
@@ -628,7 +631,7 @@ async def retrieve_history_for_subset(
         'wb-token': wb_token,
         'Content-Type': 'application/json; charset=utf-8',
     }
-    semaphore = asyncio.Semaphore(20)
+    semaphore = asyncio.Semaphore(MAX_CONCURRENT_DOWNLOADS)
 
     async with aiohttp.ClientSession(cookies=cookies) as session:
 
@@ -677,16 +680,16 @@ async def retrieve_history_for_subset(
                                     list_rows = json.loads(data_s_raw)
                                     if list_rows:
                                         stock_volume = float(list_rows[0].get("stock_volume", 0))
-                                        print(f"[DEBUG] prod_id={prod_id}, stock_volume={stock_volume}")
+                                        logger.debug("prod_id=%s, stock_volume=%s", prod_id, stock_volume)
                                     else:
-                                        print(f"[DEBUG] => prod_id={prod_id}, tableau vide => stock_volume=None")
+                                        logger.debug("prod_id=%s, tableau vide => stock_volume=None", prod_id)
                                 except (ValueError, json.JSONDecodeError) as e:
                                     stock_volume = None
-                                    print(f"[DEBUG] => prod_id={prod_id}, data_s mal formé => {e}")
+                                    logger.debug("prod_id=%s, data_s mal formé => %s", prod_id, e)
                             else:
-                                print(f"[DEBUG] => prod_id={prod_id}, data_s is None")
+                                logger.debug("prod_id=%s, data_s is None", prod_id)
                         else:
-                            print(f"[DEBUG] => prod_id={prod_id}, HTTP status={resp.status}")
+                            logger.debug("prod_id=%s, HTTP status=%s", prod_id, resp.status)
 
                         stock_data[str(prod_id)] = {
                             "prod_designation": pdes,
